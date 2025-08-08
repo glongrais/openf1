@@ -382,7 +382,10 @@ def ingest_collections(
 
     for collection, docs in tqdm(list(docs_by_collection.items()), desc="Processing collections", disable=not verbose, leave=False):
 
-        insert_data_sync(collection_name=collection, docs=docs, verbose=verbose)
+        if _global_full_refresh:
+            insert_data_sync(collection_name=collection, docs=docs, verbose=verbose, use_simple_insert=False)
+        else:
+            insert_data_sync(collection_name=collection, docs=docs, verbose=verbose, use_simple_insert=True)
 
 @cli.command()
 def ingest_session(year: int, meeting_key: int, session_key: int, verbose: bool = True):
@@ -405,6 +408,36 @@ def ingest_session(year: int, meeting_key: int, session_key: int, verbose: bool 
 
 
 @cli.command()
+def delete_session(meeting_key: int, session_key: int, verbose: bool = True):
+    """Delete all data from a specific session"""
+    collections = get_collections(meeting_key=meeting_key, session_key=session_key)
+    # Filter out "meetings" collection
+    collection_names = sorted([c.__class__.name for c in collections if c.__class__.name != "meetings"])
+    
+    if verbose:
+        logger.info(f"Deleting data from {len(collection_names)} collections: {collection_names}")
+    
+    # Import the delete_data_by_session function from db_duckdb module
+    from openf1.util.db_duckdb import delete_data_by_session
+    
+    # Total rows deleted counter
+    total_rows_deleted = 0
+    
+    # Delete data from each collection
+    for collection_name in tqdm(collection_names, desc="Deleting from collections", disable=not verbose, leave=False):
+        rows_deleted = delete_data_by_session(
+            collection_name=collection_name,
+            meeting_key=meeting_key,
+            session_key=session_key,
+            verbose=verbose
+        )
+        total_rows_deleted += rows_deleted
+    
+    if verbose:
+        logger.info(f"Session {session_key} data deletion completed: {total_rows_deleted} total rows deleted")
+
+
+@cli.command()
 def ingest_meeting(year: int, meeting_key: int, verbose: bool = True):
     """Ingest all sessions from a specific meeting"""
     session_keys = get_session_keys(year=year, meeting_key=meeting_key)
@@ -418,6 +451,20 @@ def ingest_meeting(year: int, meeting_key: int, verbose: bool = True):
             year=year, meeting_key=meeting_key, session_key=session_key, verbose=verbose
         )
 
+
+@cli.command()
+def delete_meeting(year: int, meeting_key: int, verbose: bool = True):
+    """Delete all data from all sessions in a specific meeting"""
+    session_keys = get_session_keys(year=year, meeting_key=meeting_key)
+    if verbose:
+        logger.info(f"{len(session_keys)} sessions found for meeting {meeting_key}: {session_keys}")
+
+    for session_key in tqdm(session_keys, desc="Processing sessions", disable=not verbose, leave=False):
+        if verbose:
+            tqdm.write(f"Deleting session {session_key}")
+        delete_session(
+            meeting_key=meeting_key, session_key=session_key, verbose=verbose
+        )
 
 @cli.command()
 def ingest_season(year: int, verbose: bool = True):

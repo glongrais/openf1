@@ -479,3 +479,64 @@ def insert_data_sync(collection_name: str, docs: list[dict], batch_size: int = 5
 async def insert_data_async(collection_name: str, docs: list[dict]):
     """Async wrapper for insert_data_sync (DuckDB is synchronous)"""
     insert_data_sync(collection_name, docs)
+
+
+def delete_data_by_session(collection_name: str, meeting_key: int, session_key: int, verbose: bool = True) -> int:
+    """Deletes documents from a table for a specific session
+    
+    Args:
+        collection_name: Name of the table to delete from
+        meeting_key: The meeting key to filter by
+        session_key: The session key to filter by
+        verbose: Whether to show detailed logging
+        
+    Returns:
+        Number of rows deleted
+    """
+    conn = _get_duckdb_connection()
+    
+    try:
+        # Check if the table exists first
+        table_exists = conn.execute(f"""
+            SELECT count(*) FROM information_schema.tables 
+            WHERE table_name = '{collection_name}'
+        """).fetchone()[0]
+        
+        if not table_exists:
+            if verbose:
+                logger.info(f"Collection {collection_name} does not exist, skipping")
+            return 0
+            
+        # Get the count before deletion
+        count_before = conn.execute(f"""
+            SELECT count(*) FROM {collection_name} 
+            WHERE meeting_key = ? AND session_key = ?
+        """, [meeting_key, session_key]).fetchone()[0]
+        
+        if count_before == 0:
+            if verbose:
+                logger.info(f"No data found for session {session_key} in collection {collection_name}")
+            return 0
+        
+        # Delete data
+        conn.execute(f"""
+            DELETE FROM {collection_name} 
+            WHERE meeting_key = ? AND session_key = ?
+        """, [meeting_key, session_key])
+        
+        # Get count after deletion for verification
+        count_after = conn.execute(f"""
+            SELECT count(*) FROM {collection_name} 
+            WHERE meeting_key = ? AND session_key = ?
+        """, [meeting_key, session_key]).fetchone()[0]
+        
+        rows_deleted = count_before - count_after
+        
+        if verbose:
+            logger.info(f"Deleted {rows_deleted} rows from {collection_name}")
+            
+        return rows_deleted
+        
+    except Exception as e:
+        logger.error(f"Error deleting from {collection_name}: {e}")
+        return 0
