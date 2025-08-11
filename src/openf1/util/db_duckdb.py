@@ -311,7 +311,7 @@ def session_key_to_path(session_key: int) -> str | None:
         return None
 
 
-def insert_data_sync(collection_name: str, docs: list[dict], batch_size: int = 500, use_simple_insert: bool = False, verbose: bool = True) -> None:
+def insert_data_sync(collection_name: str, docs: list[dict], batch_size: int = 2000, use_simple_insert: bool = False, verbose: bool = True) -> None:
     """Inserts documents into a DuckDB table in batches (single-threaded, memory-optimized)
     
     Args:
@@ -479,6 +479,62 @@ def insert_data_sync(collection_name: str, docs: list[dict], batch_size: int = 5
 async def insert_data_async(collection_name: str, docs: list[dict]):
     """Async wrapper for insert_data_sync (DuckDB is synchronous)"""
     insert_data_sync(collection_name, docs)
+
+
+@lru_cache(maxsize=32)
+def get_existing_sessions(year: int = None, meeting_key: int = None) -> set:
+    """Gets all sessions that exist in the database, optionally filtered by year or meeting
+    
+    Args:
+        year: Optional year to filter by
+        meeting_key: Optional meeting key to filter by
+        
+    Returns:
+        A set of tuples (meeting_key, session_key) for all existing sessions
+        
+    Note:
+        This function is cached using LRU cache, so repeated calls with the same 
+        parameters will return the cached result without hitting the database.
+    """
+    conn = _get_duckdb_connection()
+    
+    try:
+        # Check if the sessions table exists
+        table_exists = conn.execute("""
+            SELECT count(*) FROM information_schema.tables 
+            WHERE table_name = 'sessions'
+        """).fetchone()[0]
+        
+        if not table_exists:
+            return set()
+        
+        # Build query based on filters provided
+        query = "SELECT meeting_key, session_key FROM sessions"
+        params = []
+        
+        if year is not None or meeting_key is not None:
+            query += " WHERE "
+            conditions = []
+            
+            if year is not None:
+                conditions.append("year = ?")
+                params.append(year)
+                
+            if meeting_key is not None:
+                conditions.append("meeting_key = ?")
+                params.append(meeting_key)
+                
+            query += " AND ".join(conditions)
+        
+        # Execute query
+        results = conn.execute(query, params).fetchall()
+        
+        # Return a set of (meeting_key, session_key) tuples
+        return [row[1] for row in results]
+
+    except Exception as e:
+        logger.error(f"Error getting existing sessions: {e}")
+        return []
 
 
 def delete_data_by_session(collection_name: str, meeting_key: int, session_key: int, verbose: bool = True) -> int:

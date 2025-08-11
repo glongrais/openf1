@@ -18,7 +18,7 @@ from openf1.services.ingestor_livetiming.core.objects import (
     get_source_topics,
 )
 from openf1.services.ingestor_livetiming.core.processing.main import process_messages
-from openf1.util.db_duckdb import insert_data_sync  # Use DuckDB instead of MongoDB
+from openf1.util.db_duckdb import insert_data_sync, get_existing_sessions, delete_data_by_session
 from openf1.util.duckdb_document import patch_document_class  # Add DuckDB support to Document
 from openf1.util.misc import join_url, json_serializer, to_datetime, to_timedelta
 from openf1.util.schedule import get_meeting_keys
@@ -368,21 +368,33 @@ def ingest_collections(
     collection_names: list[str],
     verbose: bool = True,
 ):
-    """Ingest specific collections from a session"""
-    docs_by_collection = _get_processed_documents(
-        year=year,
-        meeting_key=meeting_key,
-        session_key=session_key,
-        collection_names=collection_names,
-        verbose=verbose,
-    )
+    existing_sessions = get_existing_sessions()
+    if _global_full_refresh or session_key not in existing_sessions:
+        docs_by_collection = _get_processed_documents(
+            year=year,
+            meeting_key=meeting_key,
+            session_key=session_key,
+            collection_names=collection_names,
+            verbose=verbose,
+        )
+    else:
+        collection_names = [
+            c for c in collection_names if c not in ["car_data", "location"]
+        ]
+        docs_by_collection = _get_processed_documents(
+            year=year,
+            meeting_key=meeting_key,
+            session_key=session_key,
+            collection_names=collection_names,
+            verbose=verbose,
+        )
 
     if verbose:
         logger.info("Inserting documents to DuckDB")  # Updated message
 
     for collection, docs in tqdm(list(docs_by_collection.items()), desc="Processing collections", disable=not verbose, leave=False):
 
-        if _global_full_refresh:
+        if _global_full_refresh or (collection != "car_data" and collection != "location"):
             insert_data_sync(collection_name=collection, docs=docs, verbose=verbose, use_simple_insert=False)
         else:
             insert_data_sync(collection_name=collection, docs=docs, verbose=verbose, use_simple_insert=True)
@@ -408,6 +420,48 @@ def ingest_session(year: int, meeting_key: int, session_key: int, verbose: bool 
 
 
 @cli.command()
+def ingest_meeting(year: int, meeting_key: int, verbose: bool = True):
+    """Ingest all sessions from a specific meeting"""
+    session_keys = get_session_keys(year=year, meeting_key=meeting_key)
+    if verbose:
+        logger.info(f"{len(session_keys)} sessions found: {session_keys}")
+    
+    for session_key in tqdm(session_keys, desc="Processing sessions", disable=not verbose, leave=False):
+        if verbose:
+            tqdm.write(f"Ingesting session {session_key}")
+        ingest_session(
+            year=year, meeting_key=meeting_key, session_key=session_key, verbose=verbose
+        )
+
+
+@cli.command()
+def ingest_season(year: int, verbose: bool = True):
+    """Ingest all meetings from a specific season"""
+    meeting_keys = get_meeting_keys(year)
+    if verbose:
+        logger.info(f"{len(meeting_keys)} meetings found: {meeting_keys}")
+
+    for meeting_key in tqdm(meeting_keys, desc="Processing meetings", disable=not verbose):
+        if verbose:
+            tqdm.write(f"Ingesting meeting {meeting_key}")
+        ingest_meeting(year=year, meeting_key=meeting_key, verbose=True)
+
+
+@cli.command()
+def delete_meeting(year: int, meeting_key: int, verbose: bool = True):
+    """Delete all data from all sessions in a specific meeting"""
+    session_keys = get_session_keys(year=year, meeting_key=meeting_key)
+    if verbose:
+        logger.info(f"{len(session_keys)} sessions found for meeting {meeting_key}: {session_keys}")
+        
+    for session_key in tqdm(session_keys, desc="Processing sessions", disable=not verbose, leave=False):
+        if verbose:
+            tqdm.write(f"Deleting session {session_key}")
+        delete_session(
+            meeting_key=meeting_key, session_key=session_key, verbose=verbose
+        )
+
+@cli.command()
 def delete_session(meeting_key: int, session_key: int, verbose: bool = True):
     """Delete all data from a specific session"""
     collections = get_collections(meeting_key=meeting_key, session_key=session_key)
@@ -416,9 +470,6 @@ def delete_session(meeting_key: int, session_key: int, verbose: bool = True):
     
     if verbose:
         logger.info(f"Deleting data from {len(collection_names)} collections: {collection_names}")
-    
-    # Import the delete_data_by_session function from db_duckdb module
-    from openf1.util.db_duckdb import delete_data_by_session
     
     # Total rows deleted counter
     total_rows_deleted = 0
@@ -435,49 +486,6 @@ def delete_session(meeting_key: int, session_key: int, verbose: bool = True):
     
     if verbose:
         logger.info(f"Session {session_key} data deletion completed: {total_rows_deleted} total rows deleted")
-
-
-@cli.command()
-def ingest_meeting(year: int, meeting_key: int, verbose: bool = True):
-    """Ingest all sessions from a specific meeting"""
-    session_keys = get_session_keys(year=year, meeting_key=meeting_key)
-    if verbose:
-        logger.info(f"{len(session_keys)} sessions found: {session_keys}")
-
-    for session_key in tqdm(session_keys, desc="Processing sessions", disable=not verbose, leave=False):
-        if verbose:
-            tqdm.write(f"Ingesting session {session_key}")
-        ingest_session(
-            year=year, meeting_key=meeting_key, session_key=session_key, verbose=verbose
-        )
-
-
-@cli.command()
-def delete_meeting(year: int, meeting_key: int, verbose: bool = True):
-    """Delete all data from all sessions in a specific meeting"""
-    session_keys = get_session_keys(year=year, meeting_key=meeting_key)
-    if verbose:
-        logger.info(f"{len(session_keys)} sessions found for meeting {meeting_key}: {session_keys}")
-
-    for session_key in tqdm(session_keys, desc="Processing sessions", disable=not verbose, leave=False):
-        if verbose:
-            tqdm.write(f"Deleting session {session_key}")
-        delete_session(
-            meeting_key=meeting_key, session_key=session_key, verbose=verbose
-        )
-
-@cli.command()
-def ingest_season(year: int, verbose: bool = True):
-    """Ingest all meetings from a specific season"""
-    meeting_keys = get_meeting_keys(year)
-    if verbose:
-        logger.info(f"{len(meeting_keys)} meetings found: {meeting_keys}")
-
-    for meeting_key in tqdm(meeting_keys, desc="Processing meetings", disable=not verbose):
-        # Update the progress bar description to show current meeting
-        if verbose:
-            tqdm.write(f"Ingesting meeting {meeting_key}")
-        ingest_meeting(year=year, meeting_key=meeting_key, verbose=True)
 
 
 if __name__ == "__main__":
