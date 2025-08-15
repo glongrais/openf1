@@ -104,7 +104,7 @@ class Document(ABC):
         return False
 
     def __hash__(self):
-        return hash((self.__class__.__name__, self.unique_key))
+        return hash(self.unique_key)
 
 
 @dataclass

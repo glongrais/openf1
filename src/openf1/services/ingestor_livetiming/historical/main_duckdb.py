@@ -1,8 +1,13 @@
 import gc
 import json
+import os
 import re
+import tempfile
+import csv
+import uuid  # added for temp table names
 from datetime import datetime, timedelta
 from functools import lru_cache
+from pathlib import Path
 
 import pytz
 import requests
@@ -18,8 +23,14 @@ from openf1.services.ingestor_livetiming.core.objects import (
     get_source_topics,
 )
 from openf1.services.ingestor_livetiming.core.processing.main import process_messages
-from openf1.util.db_duckdb import insert_data_sync, get_existing_sessions, delete_data_by_session
-from openf1.util.duckdb_document import patch_document_class  # Add DuckDB support to Document
+from openf1.util.db_duckdb import (
+    insert_data_sync,
+    get_existing_sessions,
+    delete_data_by_session,
+    _get_duckdb_connection,
+    _ensure_table_exists,
+)
+from openf1.util.duckdb_document import patch_document_class, get_primary_key_fields  # added get_primary_key_fields
 from openf1.util.misc import join_url, json_serializer, to_datetime, to_timedelta
 from openf1.util.schedule import get_meeting_keys
 from openf1.util.schedule import get_schedule as _get_schedule
@@ -37,6 +48,7 @@ cli = typer.Typer()
 # Global variables to store CLI options
 _global_log_level = "WARNING"
 _global_full_refresh = False
+_global_use_csv = False
 
 # Flag to determine if the script is being run from the command line
 _is_called_from_cli = False
@@ -45,16 +57,18 @@ _is_called_from_cli = False
 @cli.callback()
 def main(
     log_level: str = typer.Option("WARNING", "--log-level", help="Set log level (DEBUG, INFO, WARNING, ERROR)"),
-    full_refresh: bool = typer.Option(False, "--full-refresh", help="Force a complete refresh of all data")
+    full_refresh: bool = typer.Option(False, "--full-refresh", help="Force a complete refresh of all data"),
+    csv: bool = typer.Option(False, "--csv", help="Load data using CSV in DuckDB instead of individual queries"),
 ):
     """
     OpenF1 Historical Data Ingestion Tool
     
     Ingest Formula 1 historical timing data into DuckDB.
     """
-    global _global_log_level, _global_full_refresh
+    global _global_log_level, _global_full_refresh, _global_use_csv
     _global_log_level = log_level.upper()
     _global_full_refresh = full_refresh
+    _global_use_csv = csv
     
     # Configure logger based on global log_level parameter
     logger.remove()  # Remove existing handlers
@@ -360,6 +374,165 @@ def get_processed_documents(
     return docs_by_collection
 
 
+def _documents_to_csv(collection_name: str, docs: list[Document], verbose: bool = True) -> str:
+    """
+    Write documents to a CSV file for bulk loading into DuckDB
+    
+    Args:
+        collection_name: The name of the collection
+        docs: The documents to write
+        verbose: Whether to show verbose output
+        
+    Returns:
+        The path to the CSV file
+    """
+    # Create a temporary file with a unique name
+    tmp_dir = tempfile.gettempdir()
+    csv_path = os.path.join(tmp_dir, f"{collection_name}_{hash(str(docs[:5]))}.csv")
+    
+    if verbose:
+        logger.info(f"Writing {len(docs)} documents to CSV file: {csv_path}")
+    
+    # Convert documents to DuckDB format
+    prepared_docs = []
+    for doc in docs:
+        # Get document as dict with DuckDB representation
+        doc_dict = doc.to_duckdb_doc_sync()
+        prepared_docs.append(doc_dict)
+    
+    # If no documents, return empty path
+    if not prepared_docs:
+        return ""
+    
+    # Get all possible column names from all documents
+    all_columns = set()
+    for doc in prepared_docs:
+        all_columns.update(doc.keys())
+    
+    # Sort columns for consistency
+    all_columns = sorted(list(all_columns))
+    
+    # Write documents to CSV
+    with open(csv_path, 'w', newline='') as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=all_columns)
+        writer.writeheader()
+        for doc in prepared_docs:
+            # Ensure all columns are present
+            row = {col: doc.get(col, None) for col in all_columns}
+            writer.writerow(row)
+    
+    return csv_path
+
+
+def _load_csv_to_duckdb(collection_name: str, csv_path: str, verbose: bool = True) -> int:
+    """
+    Load CSV data into DuckDB via a temporary staging table and MERGE (upsert) into the final table.
+    This prevents overwriting existing rows unintentionally and ensures only changes/new rows are applied.
+    
+    Args:
+        collection_name: The name of the target table
+        csv_path: Path to the source CSV
+        verbose: Verbosity flag
+    Returns:
+        Number of rows staged (potentially inserted/updated)
+    """
+    if not os.path.exists(csv_path) or os.path.getsize(csv_path) == 0:
+        if verbose:
+            logger.info(f"CSV file is empty or doesn't exist: {csv_path}")
+        return 0
+
+    conn = _get_duckdb_connection()
+
+    # Peek first row to build/extend target schema
+    with open(csv_path, 'r') as csvfile:
+        reader = csv.DictReader(csvfile)
+        try:
+            first_row = next(reader)
+        except StopIteration:
+            if verbose:
+                logger.info("CSV file is empty")
+            return 0
+
+    _ensure_table_exists(collection_name, first_row)
+
+    # Create a unique temporary staging table name
+    staging_table = f"_stg_{collection_name}_{uuid.uuid4().hex[:8]}"
+
+    try:
+        if verbose:
+            logger.info(f"Staging CSV data into temp table {staging_table}")
+
+        # Create temp table from CSV
+        create_staging_sql = f"""
+            CREATE TEMP TABLE {staging_table} AS
+            SELECT * FROM read_csv('{csv_path}')
+        """
+        conn.execute(create_staging_sql)
+
+        # Collect columns from staging & target
+        staging_cols = [r[1] for r in conn.execute(f"PRAGMA table_info({staging_table})").fetchall()]
+        target_cols = [r[1] for r in conn.execute(f"PRAGMA table_info({collection_name})").fetchall()]
+
+        logger.info(f"Staging columns: {staging_cols}")
+
+        # Add any missing columns (as VARCHAR) to target to accommodate new fields
+        for col in staging_cols:
+            if col not in target_cols:
+                try:
+                    conn.execute(f"ALTER TABLE {collection_name} ADD COLUMN {col} VARCHAR")
+                    if verbose:
+                        logger.info(f"Added missing column {col} to {collection_name}")
+                except Exception as e:
+                    if verbose:
+                        logger.warning(f"Could not add column {col}: {e}")
+
+        # Refresh target columns list
+        target_cols = [r[1] for r in conn.execute(f"PRAGMA table_info({collection_name})").fetchall()]
+
+        # Determine primary keys for merge logic
+        primary_keys = get_primary_key_fields(collection_name)
+        primary_keys = [pk for pk in primary_keys if pk in staging_cols]
+
+        # If no primary keys available, fallback to simple INSERT (append-only semantics)
+        if not primary_keys:
+            if verbose:
+                logger.warning(f"No primary keys found for {collection_name}; performing append INSERT from staging")
+            insert_cols = [c for c in staging_cols]
+            insert_sql = f"INSERT INTO {collection_name} ({', '.join(insert_cols)}) SELECT {', '.join(insert_cols)} FROM {staging_table}"
+            conn.execute(insert_sql)
+            row_count = conn.execute(f"SELECT COUNT(*) FROM {staging_table}").fetchone()[0]
+            return row_count
+
+        # INSERT OR REPLACE approach (simpler than MERGE); relies on PK/unique constraints
+        common_cols = [c for c in staging_cols if c in target_cols]
+        col_list = ", ".join(common_cols)
+        insert_replace_sql = (
+            f"INSERT OR REPLACE INTO {collection_name} ({col_list}) "
+            f"SELECT {col_list} FROM {staging_table}"
+        )
+        if verbose:
+            logger.info(
+                f"Upserting into {collection_name} using INSERT OR REPLACE on {len(common_cols)} columns (pk={primary_keys})"
+            )
+            logger.debug(f"INSERT OR REPLACE SQL: {insert_replace_sql}")
+        conn.execute(insert_replace_sql)
+
+        staged_rows = conn.execute(f"SELECT COUNT(*) FROM {staging_table}").fetchone()[0]
+        if verbose:
+            logger.info(f"Upsert complete: {staged_rows} staged rows processed for {collection_name}")
+        return staged_rows
+
+    except Exception as e:
+        logger.error(f"Error staging/merging CSV data into {collection_name}: {e}")
+        return 0
+    finally:
+        # Remove CSV file
+        if os.path.exists(csv_path):
+            os.remove(csv_path)
+            if verbose:
+                logger.info(f"Deleted temporary CSV file: {csv_path}")
+
+
 @cli.command()
 def ingest_collections(
     year: int,
@@ -369,35 +542,34 @@ def ingest_collections(
     verbose: bool = True,
 ):
     existing_sessions = get_existing_sessions()
-    if _global_full_refresh or session_key not in existing_sessions:
-        docs_by_collection = _get_processed_documents(
-            year=year,
-            meeting_key=meeting_key,
-            session_key=session_key,
-            collection_names=collection_names,
-            verbose=verbose,
-        )
-    else:
-        collection_names = [
-            c for c in collection_names if c not in ["car_data", "location"]
-        ]
-        docs_by_collection = _get_processed_documents(
-            year=year,
-            meeting_key=meeting_key,
-            session_key=session_key,
-            collection_names=collection_names,
-            verbose=verbose,
-        )
+    if not _global_full_refresh and session_key in existing_sessions:
+        return
+    
+    docs_by_collection = _get_processed_documents(
+        year=year,
+        meeting_key=meeting_key,
+        session_key=session_key,
+        collection_names=collection_names,
+        verbose=verbose,
+    )
 
     if verbose:
         logger.info("Inserting documents to DuckDB")  # Updated message
 
     for collection, docs in tqdm(list(docs_by_collection.items()), desc="Processing collections", disable=not verbose, leave=False):
-
-        if _global_full_refresh or (collection != "car_data" and collection != "location"):
-            insert_data_sync(collection_name=collection, docs=docs, verbose=verbose, use_simple_insert=False)
+        # Use CSV method if specified
+        if _global_use_csv:
+            if verbose:
+                logger.info(f"Using CSV method for {collection}")
+            # Convert documents to CSV and load into DuckDB
+            csv_path = _documents_to_csv(collection, docs, verbose)
+            _load_csv_to_duckdb(collection, csv_path, verbose)
         else:
-            insert_data_sync(collection_name=collection, docs=docs, verbose=verbose, use_simple_insert=True)
+            # Use traditional method
+            if _global_full_refresh or (collection != "car_data" and collection != "location"):
+                insert_data_sync(collection_name=collection, docs=docs, verbose=verbose, use_simple_insert=False)
+            else:
+                insert_data_sync(collection_name=collection, docs=docs, verbose=verbose, use_simple_insert=True)
 
 @cli.command()
 def ingest_session(year: int, meeting_key: int, session_key: int, verbose: bool = True):

@@ -30,24 +30,13 @@ def to_duckdb_doc_sync(document_instance) -> dict:
     This function replaces the MongoDB-specific to_mongo_doc_sync method.
     Uses natural primary keys instead of generic _id/_key fields.
     """
-    # Get the document as a dictionary
-    if hasattr(document_instance, '__dict__'):
-        doc_dict = document_instance.__dict__.copy()
-    else:
-        # Fallback for objects without __dict__
-        doc_dict = {}
-        for attr in dir(document_instance):
-            if not attr.startswith('_') and not callable(getattr(document_instance, attr)):
-                doc_dict[attr] = getattr(document_instance, attr)
-    
+
+    doc_dict = document_instance.__dict__.copy()
+
     # Flatten nested structures and handle special types
     flattened_doc = _flatten_for_duckdb(doc_dict)
     
-    # Add hash ID for race_control records
-    if hasattr(document_instance, '__class__') and hasattr(document_instance.__class__, 'name'):
-        collection_name = document_instance.__class__.name.lower()
-        if collection_name == 'race_control':
-            flattened_doc['record_hash'] = _generate_record_hash(flattened_doc, collection_name)
+    flattened_doc['_id'] = document_instance.__hash__()
     
     return flattened_doc
 
@@ -95,24 +84,24 @@ def _json_serializer(obj):
 
 def get_primary_key_fields(collection_name: str) -> list[str]:
     """Get the primary key field(s) for a given collection/table"""
-    primary_keys = {
-        'sessions': ['session_key'],
-        'meetings': ['meeting_key'],
-        'drivers': ['driver_number', 'session_key'],  # Composite key
-        'laps': ['session_key', 'driver_number', 'lap_number'],  # Composite key
-        'car_data': ['session_key', 'driver_number', 'date'],  # Composite key with timestamp
-        'position': ['session_key', 'driver_number', 'date'],  # Composite key with timestamp
-        'intervals': ['session_key', 'driver_number', 'date'],  # Composite key with timestamp
-        'pit': ['session_key', 'driver_number', 'date'],  # Composite key with timestamp
-        'stints': ['session_key', 'driver_number', 'stint_number'],  # Composite key
-        'team_radio': ['session_key', 'driver_number', 'date'],  # Composite key with timestamp
-        'weather': ['session_key', 'date'],  # Composite key with timestamp
-        'race_control': ['record_hash'],  # Use hash of the entire record to avoid duplicates
-        'location': ['session_key', 'driver_number', 'date'],  # Composite key with timestamp
-    }
-    
-    # Default to using _key if collection is not mapped
-    return primary_keys.get(collection_name, ['_key'])
+    primary_keys = {}
+    #     'sessions': ['session_key'],
+    #     'meetings': ['meeting_key'],
+    #     'drivers': ['driver_number', 'session_key'],  # Composite key
+    #     'laps': ['session_key', 'driver_number', 'lap_number'],  # Composite key
+    #     'car_data': ['session_key', 'driver_number', 'date'],  # Composite key with timestamp
+    #     'position': ['session_key', 'driver_number', 'date'],  # Composite key with timestamp
+    #     'intervals': ['session_key', 'driver_number', 'date'],  # Composite key with timestamp
+    #     'pit': ['session_key', 'driver_number', 'date'],  # Composite key with timestamp
+    #     'stints': ['session_key', 'driver_number', 'stint_number'],  # Composite key
+    #     'team_radio': ['session_key', 'driver_number', 'date'],  # Composite key with timestamp
+    #     'weather': ['session_key', 'date'],  # Composite key with timestamp
+    #     'race_control': ['record_hash'],  # Use hash of the entire record to avoid duplicates
+    #     'location': ['session_key', 'driver_number', 'date'],  # Composite key with timestamp
+    # }
+
+    # Default to using _id if collection is not mapped
+    return primary_keys.get(collection_name, ['_id'])
 
 
 def get_table_schema(collection_name: str, sample_doc: dict) -> dict:
